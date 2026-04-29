@@ -1,4 +1,8 @@
 import argparse
+import warnings
+
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
+
 import face_recognition
 import numpy
 import glob
@@ -65,6 +69,13 @@ def save_index(dir, index):
         pickle.dump(index, indexfile)
 
 
+def fix_index(index):
+    index_new = dict()
+    for path, data in index.items():
+        index_new[str(path)] = data
+    return index_new
+
+
 # def relpath_index(dir, index):
 #     index_new = dict()
 #     for path, data in index.items():
@@ -89,30 +100,32 @@ def calc_index_entry(dir, imgpath):
 
         index_entry = [(face_locs[i], face_encs[i]) for i in range(0, max(len(face_locs), len(face_encs)))]
     except Exception as e:
-        traceback.print_exc()
+        print(f"Could not index {imgpath}")
+        # traceback.print_exc()
         pass
     return index_entry
 
 
 def compare_index_entries(ie1, ie2):
-        if ie1 is None and ie2 is None:
-            return True
-        if ie1 is None or ie2 is None:
-            return True
-        if len(ie1) != len(ie2):
-            return True
+    if ie1 is None and ie2 is None:
+        return True
+    if ie1 is None or ie2 is None:
+        return True
+    if len(ie1) != len(ie2):
+        return True
 
-        match = True
-        for i in range(len(ie1)):
-            locs_match = numpy.array_equal(ie1[i][0], ie2[i][0])
-            if ie1[i][1] is not None and ie2[i][1] is not None:
-                encs_match = numpy.allclose(ie1[i][1], ie2[i][1])
-            else:
-                encs_match = (ie1[i][1] is None) == (ie2[i][1] is None)
-            if not (locs_match and encs_match):
-                match = False
-                break
-        return match
+    match = True
+    for i in range(len(ie1)):
+        locs_match = numpy.array_equal(ie1[i][0], ie2[i][0])
+        if ie1[i][1] is not None and ie2[i][1] is not None:
+            encs_match = numpy.allclose(ie1[i][1], ie2[i][1])
+        else:
+            encs_match = (ie1[i][1] is None) == (ie2[i][1] is None)
+        if not (locs_match and encs_match):
+            match = False
+            break
+    return match
+
 
 def test_index(dir, index):
     TEST_COUNT = 10
@@ -120,7 +133,7 @@ def test_index(dir, index):
     for _ in range(0, TEST_COUNT):
         imgpath, index_entry = random.choice(list(index.items()))
         index_entry_new = calc_index_entry(dir, imgpath)
-        match = compare_index_entries(index_entry, index_entry_new):
+        match = compare_index_entries(index_entry, index_entry_new)
         print("Index {} for {}".format("ok" if match else "mismatch", imgpath))
 
 
@@ -135,28 +148,30 @@ def update_index_remove_non_existing(dir, index):
 
 
 def update_index_add_new(dir, index):
+    index_updated = False
     try:
         print("Scanning directory {}".format(dir))
         imgpaths_to_index = []
         for p in glob.glob(dir + "**", recursive=True):
             path = pathlib.Path(p)
-            if path.is_file and path.suffix.lower() in [".jpg", ".jpeg" ".png"]:
-                relpath = path.relative_to(dir)  # should not raise ValueError, right?
+            if path.is_file and path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                relpath = str(path.relative_to(dir))  # should not raise ValueError, right?
                 if relpath not in index.keys():
                     imgpaths_to_index.append(relpath)
         if len(imgpaths_to_index) == 0:
             print("Index up-to-date")
-            return True
+            return index_updated
 
         print("Found {} images to index".format(len(imgpaths_to_index)))
         for imgpath in tqdm(imgpaths_to_index):
             index_entry = calc_index_entry(dir, imgpath)
             if index_entry is not None:
                 index[imgpath] = index_entry
-        return True
+                index_updated = True
+        return index_updated
     except KeyboardInterrupt:
         print("Index build aborted")
-        return False
+        return index_updated
 
 
 def update_index(dir, index):
@@ -170,6 +185,19 @@ def known_face_name_match(known_imgpath, name):
     prefix1 = name.lower() + "_"
     prefix2 = name.lower() + "."
     return kip.startswith(prefix1) or kip.startswith(prefix2)
+
+
+def get_face_name_from_path(path):
+    i1 = path.find("_")
+    if i1 == -1:
+        i1 = len(path)
+    i2 = path.find(".")
+    if i2 == -1:
+        i2 = len(path)
+    i = min(i1, i2)
+    if i == -1:
+        i = len(path)
+    return path[:i]
 
 
 # Search for face by method 1
@@ -203,9 +231,12 @@ def search_face_1(index_known, index_images, name, threshold):
 # Search for face by method 2
 # - look for closest face among known faces
 # - consider face found if known face name matches name in parameter and distance is less or equal than threshold
-def search_face_2(index_known, index_images, name, threshold):
+def search_face_2(index_known, index_images, names, threshold):
     found_images = []
+    names_to_find = set(names)
+    names_found = set()
     for imgpath, index_entries in index_images.items():
+        names_found.clear()
         for _, face_enc in index_entries:
             closest_imgpath = None
             closest_dist = None
@@ -220,12 +251,18 @@ def search_face_2(index_known, index_images, name, threshold):
                 # Even the best match is farther than threshold, proceed to next image
                 continue
 
-            if known_face_name_match(closest_imgpath, name):
-                # Best match is at acceptable distance but does not match face looked for
-                continue
+            names_found.add(get_face_name_from_path(closest_imgpath))
 
-            found_images.append(imgpath)
-            print("{}: {} ({})".format(closest_dist, imgpath, closest_imgpath))
+            # if not known_face_name_match(closest_imgpath, names):
+            #     # Best match is at acceptable distance but does not match face looked for
+            #     continue
+            #
+            # found_images.append(imgpath)
+            # print("{}: {} ({})".format(closest_dist, imgpath, closest_imgpath))
+        # if len(names_found) > 1:
+        #     print(f"names_to_find: {names_to_find} -- names_found: {names_found}")
+        if names_to_find <= names_found:
+            print(imgpath)
     return found_images
 
 
@@ -233,41 +270,32 @@ def search_face(index_known, index_images, name, threshold):
     return search_face_2(index_known, index_images, name, threshold)
 
 
-# dir = "/home/ssuranyi/Pictures/facerectest/"
-img_dir = "/run/media/ssuranyi/My Passport 4T/Kép/"
-index = open_index(img_dir)
-# update_index(img_dir, index)
-save_index(img_dir, index)
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    prog="findface",
+    description="find images in a directory hierarchy that contain all faces specified",
+    epilog="""
+Find images recursively in <dir> that contain ALL specified faces.\n\n
 
-known_dir = "/home/ssuranyi/Pictures/KNOWN_PEOPLE_FOLDER/"
-index_known = open_index(known_dir)
-update_index(known_dir, index_known)
-save_index(known_dir, index_known)
+Images in <faces-dir> define the list of known faces. A known face with a given name can be defined by placing <name>_*.jpg images (1 or more) in <faces-dir>. Using a handful of face images for a face is supposed to increase accuracy. By default <faces-dir> is located at <dir>/FF_FACES, default location can be overriden by -F.
 
-for imgpath, data in index_known.items():
-    print(imgpath)
+Before search images has to be pre-processed (indexed). Initial indexing is CPU intense and can take a while for directories with large amount of images. Index is stored in <dir>/FF_INDEX.idx. Unless index update is disabled by flag -q, the index is always updated before search by adding entries for new images and removing entries of missing images.
 
-dest_dir = "/home/ssuranyi/Pictures/facerecout/"
-imgs = search_face(index_known, index, "Peti", 0.6)
+During actual search the path of found images is printed preceeded by a numeric value showing the distance of found faces. The numeric value can be considered as a confidence level, the lower the number indicates the more confidence. Use flag -b to produce brief output and print only the path of found images.
 
-if pathlib.Path(dest_dir).is_dir():
-    shutil.rmtree(dest_dir)
-os.mkdir(dest_dir)
-for img in tqdm(imgs):
-    imgpath = os.path.join(img_dir, img)
-    shutil.copy(imgpath, dest_dir)
+Use flag -c to copy found images to a directory <copy-dir>. By default <copy-dir> is <dir>/FF_FACES_FOUND, use -C to override. CAUTION: entire content of <copy-dir> is purged before each search.
 
-# test_index(img_dir, index)
-# save_index(img_dir, index)
+The face search logic is implemented by the face-recognition module (https://pypi.org/project/face-recognition/), a huge thanks to all contributors.
 
+To adjust results:
 
+- Use -t to change tolerance. If the calculated distance between two faces is more than the tolerance, then the faces are considered different. Otherwise the faces are considered matching.
 
+- Use -m to change method. Method 0: search for images that have at least one face that has a distance less or equal to tolerance. Method 1: search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <faces-dir> has less distance.
 
-
-
-
-
-parser = argparse.ArgumentParser("findface - search for images in a directory hierarchy that contain faces specified")
+- For good results make sure to include good quality images in <face-dir>, ideally a few images for each face. For further details about the search method please consult the documentation of face-recognition module.
+    """,
+)
 parser.add_argument(
     "-q",
     "--quick",
@@ -314,7 +342,57 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "directory",
+    "SEARCH_DIR",
     help="Directory to search within recursively.",
 )
+
+parser.add_argument(
+    "FACES",
+    help="Name of faces to find. The search returns images that contain ALL faces specified.",
+    nargs="+",
+)
+
 args = parser.parse_args()
+
+# print(args.SEARCH_DIR)
+# print(args.faces_dir)
+# exit(0)
+
+# dir = "/home/ssuranyi/Pictures/facerectest/"
+# img_dir = "/run/media/ssuranyi/My Passport 4T/Kép/"
+search_dir = args.SEARCH_DIR
+if not pathlib.Path(search_dir).exists():
+    parser.exit(1, f"SEARCH_DIR does not exist: {search_dir}")
+
+face_dir = args.faces_dir
+if not pathlib.Path(face_dir).is_absolute():
+    face_dir = str(pathlib.Path(search_dir) / face_dir)
+if not pathlib.Path(face_dir).exists():
+    parser.exit(1, f"FACE_DIR does not exist: {face_dir}")
+
+index_search = fix_index(open_index(search_dir))
+if not args.quick:
+    if update_index(search_dir, index_search):
+        save_index(search_dir, index_search)
+
+# known_dir = "/home/ssuranyi/Pictures/KNOWN_PEOPLE_FOLDER/"
+index_face = fix_index(open_index(face_dir))
+if not args.quick:
+    if update_index(face_dir, index_face):
+        save_index(face_dir, index_face)
+
+imgs = search_face(index_face, index_search, args.FACES, args.tolerance)
+
+if args.copy:
+    copy_dir = args.copy_dir
+    if not pathlib.Path(copy_dir).is_absolute():
+        copy_dir = str(pathlib.Path(search_dir) / copy_dir)
+    if pathlib.Path(copy_dir).is_dir():
+        shutil.rmtree(copy_dir)
+    os.mkdir(copy_dir)
+    for img in tqdm(imgs):
+        imgpath = os.path.join(search_dir, img)
+        shutil.copy(imgpath, copy_dir)
+
+# test_index(img_dir, index)
+# save_index(img_dir, index)
