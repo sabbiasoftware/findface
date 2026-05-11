@@ -10,12 +10,9 @@ import pathlib
 import os
 import pickle
 from tqdm import tqdm
-import tkinter
 from PIL import Image as PILImage
-from PIL import ImageTk as PILImageTk
 import random
 import shutil
-import traceback
 
 
 def resize_maybe(image, maxdim):
@@ -50,16 +47,29 @@ def load_image(path):
 INDEX_FILENAME = "facerec.idx"
 
 
-def open_index(dir):
+def open_index(dir, exclude_dir):
     index = dict()
     index_path = os.path.join(dir, INDEX_FILENAME)
-    if os.path.exists(index_path):
-        print("Opening index {}".format(index_path))
-        with open(index_path, "rb") as indexfile:
-            index = pickle.load(indexfile)
-        print("Found {} index entries".format(len(index)))
-    else:
-        print("No index found at {}".format(index_path))
+
+    if not os.path.exists(index_path):
+        print(f"No index found at {format(index_path)}")
+        return index
+
+    print("Opening index {}".format(index_path))
+    with open(index_path, "rb") as indexfile:
+        index = pickle.load(indexfile)
+    print("Found {} index entries".format(len(index)))
+
+    imgpaths_to_remove = []
+    if exclude_dir is not None:
+        for imgpath, _ in index.items():
+            imgabspath = pathlib.Path(dir, imgpath)
+            if imgabspath.is_relative_to(exclude_dir):
+                imgpaths_to_remove.append(imgpath)
+
+    for imgpath in imgpaths_to_remove:
+        index.pop(imgpath)
+
     return index
 
 
@@ -92,14 +102,14 @@ def calc_index_entry(dir, imgpath):
     index_entry = None
     try:
         img = load_image(pathlib.Path(dir).joinpath(imgpath))
-        face_locs = face_recognition.face_locations(img)
+        face_locs = face_recognition.face_locations(img, model="cnn")
         face_encs = face_recognition.face_encodings(img, known_face_locations=face_locs)
 
         if len(face_locs) != len(face_encs):
             print("Lengths do not equal {}".format(imgpath))
 
         index_entry = [(face_locs[i], face_encs[i]) for i in range(0, max(len(face_locs), len(face_encs)))]
-    except Exception as e:
+    except Exception:
         print(f"Could not index {imgpath}")
         # traceback.print_exc()
         pass
@@ -147,14 +157,18 @@ def update_index_remove_non_existing(dir, index):
     return len(imgpaths_to_remove) > 0
 
 
-def update_index_add_new(dir, index):
+def update_index_add_new(dir, exclude_dir, index):
     index_updated = False
     try:
         print("Scanning directory {}".format(dir))
         imgpaths_to_index = []
-        for p in glob.glob(dir + "**", recursive=True):
+        for p in glob.glob(dir + ("" if dir.endswith("/") else "/") + "**", recursive=True):
             path = pathlib.Path(p)
-            if path.is_file and path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+            if (
+                path.is_file
+                and (exclude_dir is None or not path.is_relative_to(exclude_dir))
+                and path.suffix.lower() in [".jpg", ".jpeg", ".png"]
+            ):
                 relpath = str(path.relative_to(dir))  # should not raise ValueError, right?
                 if relpath not in index.keys():
                     imgpaths_to_index.append(relpath)
@@ -174,9 +188,9 @@ def update_index_add_new(dir, index):
         return index_updated
 
 
-def update_index(dir, index):
+def update_index(dir, exclude_dir, index):
     removed = update_index_remove_non_existing(dir, index)
-    added = update_index_add_new(dir, index)
+    added = update_index_add_new(dir, exclude_dir, index)
     return removed or added
 
 
@@ -228,6 +242,35 @@ def search_face_1(index_known, index_images, name, threshold):
     return found_images
 
 
+def is_face_in_image(index_known, index_image, name, threshold, trace):
+    for face_loc, face_enc in index_image:
+        if trace is not None:
+            trace[face_loc] = dict()
+
+        closest_imgpath = None
+        closest_dist = None
+
+        for known_imgpath, known_index_entries in index_known.items():
+            for _, known_face_enc in known_index_entries:
+                dist = face_recognition.face_distance([known_face_enc], face_enc)[0]
+
+                if trace is not None:
+                    trace[face_loc][known_imgpath] = dist
+
+                # print(f"  -> {known_imgpath} -- {dist}")
+                if closest_dist is None or closest_dist > dist:
+                    closest_imgpath = known_imgpath
+                    closest_dist = dist
+        # print(f"closest_imgpath {closest_imgpath}, closest_dist {closest_dist}")
+        if closest_dist is None or closest_dist > threshold:
+            # Even the best match is farther than threshold, proceed to next image
+            continue
+
+        if known_face_name_match(closest_imgpath, name):
+            return True
+    return False
+
+
 # Search for face by method 2
 # - look for closest face among known faces
 # - consider face found if known face name matches name in parameter and distance is less or equal than threshold
@@ -266,8 +309,27 @@ def search_face_2(index_known, index_images, names, threshold):
     return found_images
 
 
-def search_face(index_known, index_images, name, threshold):
-    return search_face_2(index_known, index_images, name, threshold)
+def search_face_3(index_known, index_images, names, threshold, trace):
+    found_images = []
+    for imgpath, index_entries in index_images.items():
+        if trace is not None and imgpath not in trace.keys():
+            trace[imgpath] = dict()
+
+        all_faces_found = True
+        for name in names:
+            # print(f"Checking {name} in {imgpath}, {len(index_entries)} faces in image")
+            trace_next = None if trace is None else trace[imgpath]
+            if not is_face_in_image(index_known, index_entries, name, threshold, trace_next):
+                all_faces_found = False
+                break
+        if all_faces_found:
+            print(imgpath)
+            found_images.append(imgpath)
+    return found_images
+
+
+def search_face(index_known, index_images, names, threshold, trace):
+    return search_face_3(index_known, index_images, names, threshold, trace)
 
 
 parser = argparse.ArgumentParser(
@@ -277,7 +339,7 @@ parser = argparse.ArgumentParser(
     epilog="""
 Find images recursively in <dir> that contain ALL specified faces.\n\n
 
-Images in <faces-dir> define the list of known faces. A known face with a given name can be defined by placing <name>_*.jpg images (1 or more) in <faces-dir>. Using a handful of face images for a face is supposed to increase accuracy. By default <faces-dir> is located at <dir>/FF_FACES, default location can be overriden by -F.
+Images in <FACES-DIR> define the list of known faces. A known face with a given name can be defined by placing <name>_*.jpg images (1 or more) in <FACES-DIR>. Using a handful of face images for a face is supposed to increase accuracy. By default <FACES-DIR> is located at <dir>/FF_FACES, default location can be overriden by -F.
 
 Before search images has to be pre-processed (indexed). Initial indexing is CPU intense and can take a while for directories with large amount of images. Index is stored in <dir>/FF_INDEX.idx. Unless index update is disabled by flag -q, the index is always updated before search by adding entries for new images and removing entries of missing images.
 
@@ -291,7 +353,7 @@ To adjust results:
 
 - Use -t to change tolerance. If the calculated distance between two faces is more than the tolerance, then the faces are considered different. Otherwise the faces are considered matching.
 
-- Use -m to change method. Method 0: search for images that have at least one face that has a distance less or equal to tolerance. Method 1: search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <faces-dir> has less distance.
+- Use -m to change method. Method 0: search for images that have at least one face that has a distance less or equal to tolerance. Method 1: search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <FACES-DIR> has less distance.
 
 - For good results make sure to include good quality images in <face-dir>, ideally a few images for each face. For further details about the search method please consult the documentation of face-recognition module.
     """,
@@ -338,7 +400,7 @@ parser.add_argument(
     "--method",
     type=int,
     choices=[0, 1],
-    help="Choose search method (0 or 1). 0: search for images that have at least one face that has a distance less or equal to tolerance. 1 (default): search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <faces-dir> has less distance.",
+    help="Choose search method (0 or 1). 0: search for images that have at least one face that has a distance less or equal to tolerance. 1 (default): search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <FACES-DIR> has less distance.",
 )
 
 parser.add_argument(
@@ -370,18 +432,21 @@ if not pathlib.Path(face_dir).is_absolute():
 if not pathlib.Path(face_dir).exists():
     parser.exit(1, f"FACE_DIR does not exist: {face_dir}")
 
-index_search = fix_index(open_index(search_dir))
+index_search = fix_index(open_index(search_dir, face_dir))
 if not args.quick:
-    if update_index(search_dir, index_search):
+    if update_index(search_dir, face_dir, index_search):
         save_index(search_dir, index_search)
 
 # known_dir = "/home/ssuranyi/Pictures/KNOWN_PEOPLE_FOLDER/"
-index_face = fix_index(open_index(face_dir))
+index_face = fix_index(open_index(face_dir, None))
 if not args.quick:
-    if update_index(face_dir, index_face):
+    if update_index(face_dir, None, index_face):
         save_index(face_dir, index_face)
 
-imgs = search_face(index_face, index_search, args.FACES, args.tolerance)
+trace = dict()
+imgs = search_face(index_face, index_search, args.FACES, args.tolerance, trace)
+
+print(trace)
 
 if args.copy:
     copy_dir = args.copy_dir
