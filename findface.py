@@ -17,7 +17,7 @@ import shutil
 
 def resize_maybe(image, maxdim):
     ratio = float(maxdim) / float(max(image.width, image.height))
-    return image.resize((int(float(image.width) * ratio), int(float(image.height) * ratio)))
+    return image.resize((int(float(image.width) * ratio), int(float(image.height) * ratio))), ratio
 
 
 def rotate_maybe(image):
@@ -39,26 +39,29 @@ def rotate_maybe(image):
 
 
 def load_image(path):
-    image = resize_maybe(rotate_maybe(PILImage.open(path)), 1024)
+    image, ratio = resize_maybe(rotate_maybe(PILImage.open(path)), 2048)
     image = numpy.array(image)
-    return image
+    return image, ratio
 
 
 INDEX_FILENAME = "facerec.idx"
 
 
-def open_index(dir, exclude_dir):
+def open_index(dir, exclude_dir, brief=False):
     index = dict()
     index_path = os.path.join(dir, INDEX_FILENAME)
 
     if not os.path.exists(index_path):
-        print(f"No index found at {format(index_path)}")
+        if not brief:
+            print(f"No index found at {format(index_path)}")
         return index
 
-    print("Opening index {}".format(index_path))
+    if not brief:
+        print("Opening index {}".format(index_path))
     with open(index_path, "rb") as indexfile:
         index = pickle.load(indexfile)
-    print("Found {} index entries".format(len(index)))
+    if not brief:
+        print("Found {} index entries".format(len(index)))
 
     imgpaths_to_remove = []
     if exclude_dir is not None:
@@ -101,8 +104,10 @@ def fix_index(index):
 def calc_index_entry(dir, imgpath):
     index_entry = None
     try:
-        img = load_image(pathlib.Path(dir).joinpath(imgpath))
-        face_locs = face_recognition.face_locations(img, model="cnn")
+        img, ratio = load_image(pathlib.Path(dir).joinpath(imgpath))
+        face_locs = face_recognition.face_locations(img, model="hog")
+        face_locs_with_ratio = [(*face_loc, ratio) for face_loc in face_locs]
+        face_locs = face_locs_with_ratio
         face_encs = face_recognition.face_encodings(img, known_face_locations=face_locs)
 
         if len(face_locs) != len(face_encs):
@@ -157,10 +162,11 @@ def update_index_remove_non_existing(dir, index):
     return len(imgpaths_to_remove) > 0
 
 
-def update_index_add_new(dir, exclude_dir, index):
+def update_index_add_new(dir, exclude_dir, index, brief=False):
     index_updated = False
     try:
-        print("Scanning directory {}".format(dir))
+        if not brief:
+            print("Scanning directory {}".format(dir))
         imgpaths_to_index = []
         for p in glob.glob(dir + ("" if dir.endswith("/") else "/") + "**", recursive=True):
             path = pathlib.Path(p)
@@ -173,10 +179,12 @@ def update_index_add_new(dir, exclude_dir, index):
                 if relpath not in index.keys():
                     imgpaths_to_index.append(relpath)
         if len(imgpaths_to_index) == 0:
-            print("Index up-to-date")
+            if not brief:
+                print("Index up-to-date")
             return index_updated
 
-        print("Found {} images to index".format(len(imgpaths_to_index)))
+        if not brief:
+            print("Found {} images to index".format(len(imgpaths_to_index)))
         for imgpath in tqdm(imgpaths_to_index):
             index_entry = calc_index_entry(dir, imgpath)
             if index_entry is not None:
@@ -184,13 +192,14 @@ def update_index_add_new(dir, exclude_dir, index):
                 index_updated = True
         return index_updated
     except KeyboardInterrupt:
-        print("Index build aborted")
+        if not brief:
+            print("Index build aborted")
         return index_updated
 
 
-def update_index(dir, exclude_dir, index):
+def update_index(dir, exclude_dir, index, brief=False):
     removed = update_index_remove_non_existing(dir, index)
-    added = update_index_add_new(dir, exclude_dir, index)
+    added = update_index_add_new(dir, exclude_dir, index, brief=brief)
     return removed or added
 
 
@@ -309,7 +318,7 @@ def search_face_2(index_known, index_images, names, threshold):
     return found_images
 
 
-def search_face_3(index_known, index_images, names, threshold, trace):
+def search_face_3(index_known, index_images, names, threshold, trace, limit=None, exclude_names=None):
     found_images = []
     for imgpath, index_entries in index_images.items():
         if trace is not None and imgpath not in trace.keys():
@@ -317,19 +326,64 @@ def search_face_3(index_known, index_images, names, threshold, trace):
 
         all_faces_found = True
         for name in names:
-            # print(f"Checking {name} in {imgpath}, {len(index_entries)} faces in image")
             trace_next = None if trace is None else trace[imgpath]
             if not is_face_in_image(index_known, index_entries, name, threshold, trace_next):
                 all_faces_found = False
                 break
+        if all_faces_found and exclude_names:
+            for ex_name in exclude_names:
+                if is_face_in_image(index_known, index_entries, ex_name, threshold, None):
+                    all_faces_found = False
+                    break
         if all_faces_found:
             print(imgpath)
             found_images.append(imgpath)
+            if limit is not None and len(found_images) >= limit:
+                break
     return found_images
 
 
-def search_face(index_known, index_images, names, threshold, trace):
-    return search_face_3(index_known, index_images, names, threshold, trace)
+def search_face(index_known, index_images, names, threshold, trace, limit=None, exclude_names=None):
+    return search_face_3(index_known, index_images, names, threshold, trace, limit=limit, exclude_names=exclude_names)
+
+
+def generate_trace_html(trace, search_dir):
+    styles = (
+        ".img-wrap{position:relative;display:inline-block}"
+        ".img-wrap img{display:block}"
+        ".face-box{position:absolute;border:2px solid red;"
+        "background:rgba(255,0,0,0.1);cursor:pointer}"
+    )
+    html = [
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        f"<title>Face Trace</title><style>{styles}</style>"
+        "</head><body>"
+    ]
+    for imgpath, facelocs in trace.items():
+        fullpath = os.path.join(search_dir, imgpath)
+        with PILImage.open(fullpath) as img:
+            img = rotate_maybe(img)
+            w, h = img.size
+
+        html.append(f'<div class="img-wrap"><img src="{imgpath}">')
+        for faceloc, knownimgs in facelocs.items():
+            top, right, bottom, left, ratio = faceloc
+            top /= ratio
+            right /= ratio
+            bottom /= ratio
+            left /= ratio
+            l_pct = left / w * 100
+            t_pct = top / h * 100
+            w_pct = (right - left) / w * 100
+            h_pct = (bottom - top) / h * 100
+            tooltip = "\n".join(f"{k}: {v}" for k, v in sorted(knownimgs.items(), key=lambda x: x[1]))
+            html.append(
+                f'<div class="face-box" style="left:{l_pct:.1f}%;top:{t_pct:.1f}%;'
+                f'width:{w_pct:.1f}%;height:{h_pct:.1f}%;" title="{tooltip}"></div>'
+            )
+        html.append("</div>")
+    html.append("</body></html>")
+    return "".join(html)
 
 
 parser = argparse.ArgumentParser(
@@ -358,11 +412,18 @@ To adjust results:
 - For good results make sure to include good quality images in <face-dir>, ideally a few images for each face. For further details about the search method please consult the documentation of face-recognition module.
     """,
 )
-parser.add_argument(
+group = parser.add_mutually_exclusive_group()
+group.add_argument(
     "-q",
     "--quick",
     action="store_true",
     help="Quick find, skip updating index. When searching in a directory the first time, make sure to use facefind WITHOUT this paramater, to allow building the initial index.",
+)
+group.add_argument(
+    "-r",
+    "--rebuild",
+    action="store_true",
+    help="Force rebuild of indexes from scratch before search.",
 )
 parser.add_argument(
     "-F",
@@ -389,6 +450,13 @@ parser.add_argument(
     help="Reduce verbosity and print only path of found images.",
 )
 parser.add_argument(
+    "-l",
+    "--limit",
+    type=int,
+    default=None,
+    help="Stop search after finding N images.",
+)
+parser.add_argument(
     "-t",
     "--tolerance",
     type=float,
@@ -404,14 +472,30 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "-d",
+    "--debug",
+    action="store_true",
+    help="Generate ff_trace.html in SEARCH_DIR with face matching details.",
+)
+
+parser.add_argument(
     "SEARCH_DIR",
     help="Directory to search within recursively.",
 )
 
 parser.add_argument(
-    "FACES",
-    help="Name of faces to find. The search returns images that contain ALL faces specified.",
-    nargs="+",
+    "-i",
+    "--include-face",
+    action="append",
+    required=True,
+    help="Name of face to find. May be specified multiple times. The search returns images that contain ALL faces specified.",
+)
+parser.add_argument(
+    "-x",
+    "--exclude-face",
+    action="append",
+    default=None,
+    help="Name of face to exclude. May be specified multiple times. Images containing any of these faces are skipped.",
 )
 
 args = parser.parse_args()
@@ -432,21 +516,30 @@ if not pathlib.Path(face_dir).is_absolute():
 if not pathlib.Path(face_dir).exists():
     parser.exit(1, f"FACE_DIR does not exist: {face_dir}")
 
-index_search = fix_index(open_index(search_dir, face_dir))
+if args.rebuild:
+    for idx_dir in [search_dir, face_dir]:
+        idx_path = os.path.join(idx_dir, INDEX_FILENAME)
+        if os.path.exists(idx_path):
+            os.remove(idx_path)
+
+index_search = fix_index(open_index(search_dir, face_dir, brief=args.brief))
 if not args.quick:
-    if update_index(search_dir, face_dir, index_search):
+    if update_index(search_dir, face_dir, index_search, brief=args.brief):
         save_index(search_dir, index_search)
 
 # known_dir = "/home/ssuranyi/Pictures/KNOWN_PEOPLE_FOLDER/"
-index_face = fix_index(open_index(face_dir, None))
+index_face = fix_index(open_index(face_dir, None, brief=args.brief))
 if not args.quick:
-    if update_index(face_dir, None, index_face):
+    if update_index(face_dir, None, index_face, brief=args.brief):
         save_index(face_dir, index_face)
 
-trace = dict()
-imgs = search_face(index_face, index_search, args.FACES, args.tolerance, trace)
+trace = dict() if args.debug else None
+imgs = search_face(index_face, index_search, args.include_face, args.tolerance, trace, limit=args.limit, exclude_names=args.exclude_face)
 
-print(trace)
+if args.debug:
+    trace_path = pathlib.Path(search_dir) / "ff_trace.html"
+    with open(trace_path, "w") as f:
+        f.write(generate_trace_html(trace, search_dir))
 
 if args.copy:
     copy_dir = args.copy_dir
