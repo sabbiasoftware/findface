@@ -173,7 +173,7 @@ def update_index_add_new(dir, exclude_dir, index, brief=False):
             if (
                 path.is_file
                 and (exclude_dir is None or not path.is_relative_to(exclude_dir))
-                and path.suffix.lower() in [".jpg", ".jpeg", ".png"]
+                and path.suffix.lower() in [".jpg", ".jpeg"]
             ):
                 relpath = str(path.relative_to(dir))  # should not raise ValueError, right?
                 if relpath not in index.keys():
@@ -367,7 +367,8 @@ def generate_trace_html(trace, search_dir):
 
         html.append(f'<div class="img-wrap"><img src="{imgpath}">')
         for faceloc, knownimgs in facelocs.items():
-            top, right, bottom, left, ratio = faceloc
+            top, right, bottom, left = faceloc[:4]
+            ratio = faceloc[4] if len(faceloc) == 5 else 1
             top /= ratio
             right /= ratio
             bottom /= ratio
@@ -386,118 +387,122 @@ def generate_trace_html(trace, search_dir):
     return "".join(html)
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    prog="findface",
-    description="find images in a directory hierarchy that contain all faces specified",
-    epilog="""
-Find images recursively in <dir> that contain ALL specified faces.\n\n
+def create_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        prog="findface",
+        description="find images in a directory hierarchy that contain all faces specified",
+        epilog="""
+    Find images recursively in <dir> that contain ALL specified faces.\n\n
 
-Images in <FACES-DIR> define the list of known faces. A known face with a given name can be defined by placing <name>_*.jpg images (1 or more) in <FACES-DIR>. Using a handful of face images for a face is supposed to increase accuracy. By default <FACES-DIR> is located at <dir>/FF_FACES, default location can be overriden by -F.
+    Images in <FACES-DIR> define the list of known faces. A known face with a given name can be defined by placing <name>_*.jpg images (1 or more) in <FACES-DIR>. Using a handful of face images for a face is supposed to increase accuracy. By default <FACES-DIR> is located at <dir>/FF_FACES, default location can be overriden by -F.
 
-Before search images has to be pre-processed (indexed). Initial indexing is CPU intense and can take a while for directories with large amount of images. Index is stored in <dir>/FF_INDEX.idx. Unless index update is disabled by flag -q, the index is always updated before search by adding entries for new images and removing entries of missing images.
+    Before search images has to be pre-processed (indexed). Initial indexing is CPU intense and can take a while for directories with large amount of images. Index is stored in <dir>/FF_INDEX.idx. Unless index update is disabled by flag -q, the index is always updated before search by adding entries for new images and removing entries of missing images.
 
-During actual search the path of found images is printed preceeded by a numeric value showing the distance of found faces. The numeric value can be considered as a confidence level, the lower the number indicates the more confidence. Use flag -b to produce brief output and print only the path of found images.
+    During actual search the path of found images is printed preceeded by a numeric value showing the distance of found faces. The numeric value can be considered as a confidence level, the lower the number indicates the more confidence. Use flag -b to produce brief output and print only the path of found images.
 
-Use flag -c to copy found images to a directory <copy-dir>. By default <copy-dir> is <dir>/FF_FACES_FOUND, use -C to override. CAUTION: entire content of <copy-dir> is purged before each search.
+    Use flag -c to copy found images to a directory <copy-dir>. By default <copy-dir> is <dir>/FF_FACES_FOUND, use -C to override. CAUTION: entire content of <copy-dir> is purged before each search.
 
-The face search logic is implemented by the face-recognition module (https://pypi.org/project/face-recognition/), a huge thanks to all contributors.
+    The face search logic is implemented by the face-recognition module (https://pypi.org/project/face-recognition/), a huge thanks to all contributors.
 
-To adjust results:
+    To adjust results:
 
-- Use -t to change tolerance. If the calculated distance between two faces is more than the tolerance, then the faces are considered different. Otherwise the faces are considered matching.
+    - Use -t to change tolerance. If the calculated distance between two faces is more than the tolerance, then the faces are considered different. Otherwise the faces are considered matching.
 
-- Use -m to change method. Method 0: search for images that have at least one face that has a distance less or equal to tolerance. Method 1: search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <FACES-DIR> has less distance.
+    - Use -m to change method. Method 0: search for images that have at least one face that has a distance less or equal to tolerance. Method 1: search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <FACES-DIR> has less distance.
 
-- For good results make sure to include good quality images in <face-dir>, ideally a few images for each face. For further details about the search method please consult the documentation of face-recognition module.
-    """,
-)
-group = parser.add_mutually_exclusive_group()
-group.add_argument(
-    "-q",
-    "--quick",
-    action="store_true",
-    help="Quick find, skip updating index. When searching in a directory the first time, make sure to use facefind WITHOUT this paramater, to allow building the initial index.",
-)
-group.add_argument(
-    "-r",
-    "--rebuild",
-    action="store_true",
-    help="Force rebuild of indexes from scratch before search.",
-)
-parser.add_argument(
-    "-F",
-    "--faces-dir",
-    default="FF_FACES",
-    help="Override default face directory of <dir>/FF_FACES. If relative, then relative to <dir>.",
-)
-parser.add_argument(
-    "-c",
-    "--copy",
-    action="store_true",
-    help="Copy images found to a designated destination folder. Default destination directory is <dir>/FF_FACES_FOUND, use -C to override.",
-)
-parser.add_argument(
-    "-C",
-    "--copy-dir",
-    default="FF_FACES_FOUND",
-    help="Override default destination folder of <dir>/FF_FACES_FOUND. If relative, then relative to <dir>.",
-)
-parser.add_argument(
-    "-b",
-    "--brief",
-    action="store_true",
-    help="Reduce verbosity and print only path of found images.",
-)
-parser.add_argument(
-    "-l",
-    "--limit",
-    type=int,
-    default=None,
-    help="Stop search after finding N images.",
-)
-parser.add_argument(
-    "-t",
-    "--tolerance",
-    type=float,
-    default=0.6,
-    help="Override default tolerance of 0.6. Lower tolerance value results less faces found.",
-)
-parser.add_argument(
-    "-m",
-    "--method",
-    type=int,
-    choices=[0, 1],
-    help="Choose search method (0 or 1). 0: search for images that have at least one face that has a distance less or equal to tolerance. 1 (default): search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <FACES-DIR> has less distance.",
-)
+    - For good results make sure to include good quality images in <face-dir>, ideally a few images for each face. For further details about the search method please consult the documentation of face-recognition module.
+        """,
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-q",
+        "--quick",
+        action="store_true",
+        help="Quick find, skip updating index. When searching in a directory the first time, make sure to use facefind WITHOUT this paramater, to allow building the initial index.",
+    )
+    group.add_argument(
+        "-r",
+        "--rebuild",
+        action="store_true",
+        help="Force rebuild of indexes from scratch before search.",
+    )
+    parser.add_argument(
+        "-F",
+        "--faces-dir",
+        default="FF_FACES",
+        help="Override default face directory of <dir>/FF_FACES. If relative, then relative to <dir>.",
+    )
+    parser.add_argument(
+        "-c",
+        "--copy",
+        action="store_true",
+        help="Copy images found to a designated destination folder. Default destination directory is <dir>/FF_FACES_FOUND, use -C to override.",
+    )
+    parser.add_argument(
+        "-C",
+        "--copy-dir",
+        default="FF_FACES_FOUND",
+        help="Override default destination folder of <dir>/FF_FACES_FOUND. If relative, then relative to <dir>.",
+    )
+    parser.add_argument(
+        "-b",
+        "--brief",
+        action="store_true",
+        help="Reduce verbosity and print only path of found images.",
+    )
+    parser.add_argument(
+        "-l",
+        "--limit",
+        type=int,
+        default=None,
+        help="Stop search after finding N images.",
+    )
+    parser.add_argument(
+        "-t",
+        "--tolerance",
+        type=float,
+        default=0.6,
+        help="Override default tolerance of 0.6. Lower tolerance value results less faces found.",
+    )
+    parser.add_argument(
+        "-m",
+        "--method",
+        type=int,
+        choices=[0, 1],
+        help="Choose search method (0 or 1). 0: search for images that have at least one face that has a distance less or equal to tolerance. 1 (default): search for images that have at least one face that has a distance less or equal to tolerance AND no other face in <FACES-DIR> has less distance.",
+    )
 
-parser.add_argument(
-    "-d",
-    "--debug",
-    action="store_true",
-    help="Generate ff_trace.html in SEARCH_DIR with face matching details.",
-)
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Generate ff_trace.html in SEARCH_DIR with face matching details.",
+    )
 
-parser.add_argument(
-    "SEARCH_DIR",
-    help="Directory to search within recursively.",
-)
+    parser.add_argument(
+        "SEARCH_DIR",
+        help="Directory to search within recursively.",
+    )
 
-parser.add_argument(
-    "-i",
-    "--include-face",
-    action="append",
-    required=True,
-    help="Name of face to find. May be specified multiple times. The search returns images that contain ALL faces specified.",
-)
-parser.add_argument(
-    "-x",
-    "--exclude-face",
-    action="append",
-    default=None,
-    help="Name of face to exclude. May be specified multiple times. Images containing any of these faces are skipped.",
-)
+    parser.add_argument(
+        "-i",
+        "--include-face",
+        action="append",
+        required=True,
+        help="Name of face to find. May be specified multiple times. The search returns images that contain ALL faces specified.",
+    )
+    parser.add_argument(
+        "-x",
+        "--exclude-face",
+        action="append",
+        default=None,
+        help="Name of face to exclude. May be specified multiple times. Images containing any of these faces are skipped.",
+    )
+    return parser
 
+
+parser = create_parser()
 args = parser.parse_args()
 
 # print(args.SEARCH_DIR)
@@ -534,7 +539,15 @@ if not args.quick:
         save_index(face_dir, index_face)
 
 trace = dict() if args.debug else None
-imgs = search_face(index_face, index_search, args.include_face, args.tolerance, trace, limit=args.limit, exclude_names=args.exclude_face)
+imgs = search_face(
+    index_face,
+    index_search,
+    args.include_face,
+    args.tolerance,
+    trace,
+    limit=args.limit,
+    exclude_names=args.exclude_face,
+)
 
 if args.debug:
     trace_path = pathlib.Path(search_dir) / "ff_trace.html"
